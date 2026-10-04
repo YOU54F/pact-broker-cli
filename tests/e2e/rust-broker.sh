@@ -4,7 +4,8 @@
 #
 #   PACT_BROKER_RS_DIR=../../you54f/pact_broker-rs tests/e2e/rust-broker.sh
 #
-# PACT_BROKER_RS_BIN points at a built broker instead. Needs curl and jq.
+# PACT_BROKER_RS_BIN points at a built broker instead. Needs curl, jq and
+# python3 (for the stub comparator).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -23,8 +24,11 @@ PORT=${PORT:-$((20000 + RANDOM % 10000))}
 BROKER="http://localhost:$PORT"
 BLOBS="$WORK/blobs"
 BROKER_PID=
+COMPARATOR_PORT=$((PORT + 1))
+COMPARATOR_PID=
 cleanup() {
   [[ -n "$BROKER_PID" ]] && kill "$BROKER_PID" 2>/dev/null || true
+  [[ -n "$COMPARATOR_PID" ]] && kill "$COMPARATOR_PID" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -37,6 +41,11 @@ fail() {
 }
 step() { echo "==> $*"; }
 
+step "Starting a stub comparator on port $COMPARATOR_PORT"
+python3 tests/e2e/stub-comparator.py "$COMPARATOR_PORT" >"$WORK/comparator.log" 2>&1 &
+COMPARATOR_PID=$!
+disown "$COMPARATOR_PID"
+
 step "Starting the Rust broker on $BROKER"
 (
   cd "$WORK"
@@ -47,6 +56,7 @@ step "Starting the Rust broker on $BROKER"
     PACT_BROKER_BLOB_STORE=filesystem \
     PACT_BROKER_BLOB_STORE_PATH="$BLOBS" \
     PACT_BROKER_ENABLE_BDCT=true \
+    PACT_BROKER_BDCT_COMPARATOR_URL="http://127.0.0.1:$COMPARATOR_PORT" \
     "$PACT_BROKER_RS_BIN"
 ) >"$WORK/broker.log" 2>&1 &
 BROKER_PID=$!
@@ -190,5 +200,57 @@ curl -sf -H 'Accept: application/hal+json' "$BROKER/contracts/provider/e2e-provi
   | jq -e '(._links.self.href | endswith("/version/3.0.1"))
     and .verificationResults.success == false' >/dev/null \
   || fail "the latest contract is not 3.0.1's"
+
+# With a comparator configured, the broker compares each consumer pact with
+# the provider's contracts in the background, and can-i-deploy uses the
+# verdict. The stub passes a pact when oas.yml has every path it requests.
+bdct_url="$BROKER/contracts/bi-directional/provider/e2e-provider/version"
+consumer_pact() {
+  jq --arg path "$1" '.consumer.name = "e2e-consumer" | .provider.name = "e2e-provider"
+    | .interactions |= map(.request.path = $path)' \
+    pacts/GettingStartedOrderWeb-GettingStartedOrderApi.json >"$WORK/e2e-consumer.json"
+}
+compared() {
+  local view
+  for _ in $(seq 1 100); do
+    view=$(curl -sf -H 'Accept: application/hal+json' \
+      "$bdct_url/$1/consumer/e2e-consumer/version/$2/cross-contract-verification-results") \
+      && jq -e '._embedded.crossContractVerificationResults' <<<"$view" >/dev/null \
+      && { echo "$view"; return; }
+    sleep 0.1
+  done
+  fail "no comparison of e2e-consumer $2 with e2e-provider $1"
+}
+
+step "Publishing a self-verified contract as 3.0.3"
+"$CLI" pactflow publish-provider-contract oas.yml --provider e2e-provider \
+  --provider-app-version 3.0.3 --branch main --verification-success --verifier e2e \
+  --verification-results "$WORK/results.txt" --verification-results-content-type text/plain \
+  || fail "publish-provider-contract 3.0.3"
+
+step "A consumer pact within the contract is compared, and passes"
+consumer_pact /contracts/publish
+"$CLI" publish "$WORK/e2e-consumer.json" --consumer-app-version 1.0.0 --branch main \
+  || fail "publishing e2e-consumer 1.0.0"
+view=$(compared 3.0.3 1.0.0)
+jq -e '._embedded.crossContractVerificationResults
+  | .success == true and .verifier == "e2e-stub" and .results == {errors: [], warnings: []}' <<<"$view" >/dev/null \
+  || fail "the comparison of 1.0.0 did not pass: $(jq -c ._embedded.crossContractVerificationResults <<<"$view")"
+"$CLI" can-i-deploy --pacticipant e2e-consumer --version 1.0.0 \
+  --pacticipant e2e-provider --version 3.0.3 \
+  || fail "can-i-deploy with a passing comparison"
+
+step "A consumer pact outside the contract is compared, and fails"
+consumer_pact /orders
+"$CLI" publish "$WORK/e2e-consumer.json" --consumer-app-version 1.0.1 --branch main \
+  || fail "publishing e2e-consumer 1.0.1"
+view=$(compared 3.0.3 1.0.1)
+jq -e '._embedded.crossContractVerificationResults | .success == false
+  and (.results.errors | length > 0)' <<<"$view" >/dev/null \
+  || fail "the comparison of 1.0.1 did not fail: $(jq -c ._embedded.crossContractVerificationResults <<<"$view")"
+if "$CLI" can-i-deploy --pacticipant e2e-consumer --version 1.0.1 \
+  --pacticipant e2e-provider --version 3.0.3; then
+  fail "can-i-deploy passed with a failed comparison"
+fi
 
 echo "PASS: the CLI works against the Rust broker ($(blob_count) blobs stored)"
