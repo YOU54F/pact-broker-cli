@@ -46,6 +46,7 @@ step "Starting the Rust broker on $BROKER"
     PACT_BROKER_BASE_URL="$BROKER" \
     PACT_BROKER_BLOB_STORE=filesystem \
     PACT_BROKER_BLOB_STORE_PATH="$BLOBS" \
+    PACT_BROKER_ENABLE_BDCT=true \
     "$PACT_BROKER_RS_BIN"
 ) >"$WORK/broker.log" 2>&1 &
 BROKER_PID=$!
@@ -132,5 +133,62 @@ step "Recording a deployment and checking against the environment"
 step "Merging a pact (PATCH) reads the stored blob"
 "$CLI" publish pacts/GettingStartedOrderWeb-GettingStartedOrderApi.json \
   --consumer-app-version 1.0.1 --branch main --merge || fail "publish --merge"
+
+# The broker runs with its BDCT module on (PACT_BROKER_ENABLE_BDCT), which
+# adds PactFlow's provider-contract resources over the generic core.
+contract_url="$BROKER/contracts/provider/e2e-provider/version"
+contract() { curl -sf -H 'Accept: application/hal+json' "$contract_url/$1"; }
+
+step "Publishing an OpenAPI provider contract with no self-verification"
+blobs_before=$(blob_count)
+"$CLI" pactflow publish-provider-contract oas.yml --provider e2e-provider \
+  --provider-app-version 3.0.0 --branch main --tag e2e \
+  || fail "publish-provider-contract"
+got=$(contract 3.0.0) || fail "GET the contract for 3.0.0"
+[[ $(jq -r .content <<<"$got" | base64 -d) == $(cat oas.yml) ]] \
+  || fail "the contract read back is not oas.yml"
+jq -e '.contractType == "oas" and .contentType == "application/yaml"
+  and (has("verificationResults") | not)' <<<"$got" >/dev/null \
+  || fail "unexpected contract $got"
+[[ $(blob_count) == $((blobs_before + 1)) ]] \
+  || fail "expected one new blob for the contract, found $(blob_count)"
+
+step "Publishing it again with self-verification results"
+echo "all 12 operations verified" >"$WORK/results.txt"
+"$CLI" pactflow publish-provider-contract oas.yml --provider e2e-provider \
+  --provider-app-version 3.0.0 --branch main \
+  --verification-success --verification-results "$WORK/results.txt" \
+  --verification-results-content-type text/plain --verification-results-format text \
+  --verifier e2e --verifier-version 1.2.3 \
+  || fail "publish-provider-contract with results"
+contract 3.0.0 | jq -e '.verificationResults | .success == true
+  and .verifier == "e2e" and .verifierVersion == "1.2.3"
+  and .contentType == "text/plain" and .format == "text"' >/dev/null \
+  || fail "the self-verification results were not recorded"
+[[ $(contract 3.0.0 | jq -r .verificationResults.content | base64 -d) == "all 12 operations verified" ]] \
+  || fail "the self-verification results read back differ"
+
+step "A different contract for the same version is refused"
+sed 's/^\( *title:\).*/\1 changed/' oas.yml >"$WORK/changed.yml"
+if "$CLI" pactflow publish-provider-contract "$WORK/changed.yml" --provider e2e-provider \
+  --provider-app-version 3.0.0 --branch main; then
+  fail "a conflicting contract was accepted"
+fi
+
+step "Self-verification results need content, as in PactFlow"
+if "$CLI" pactflow publish-provider-contract oas.yml --provider e2e-provider \
+  --provider-app-version 3.0.2 --branch main --verification-success --verifier e2e; then
+  fail "self-verification results with no content were accepted"
+fi
+
+step "A failed self-verification on a new version is the latest contract"
+"$CLI" pactflow publish-provider-contract "$WORK/changed.yml" --provider e2e-provider \
+  --provider-app-version 3.0.1 --branch main --verification-exit-code 1 --verifier e2e \
+  --verification-results "$WORK/results.txt" --verification-results-content-type text/plain \
+  || fail "publish-provider-contract 3.0.1"
+curl -sf -H 'Accept: application/hal+json' "$BROKER/contracts/provider/e2e-provider/latest" \
+  | jq -e '(._links.self.href | endswith("/version/3.0.1"))
+    and .verificationResults.success == false' >/dev/null \
+  || fail "the latest contract is not 3.0.1's"
 
 echo "PASS: the CLI works against the Rust broker ($(blob_count) blobs stored)"
